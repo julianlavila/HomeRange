@@ -1,0 +1,211 @@
+---
+title: "GBif data cleaning"
+author: "Julian Avila-Jimenez"
+date: "20/8/2020"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = T, message = F, warning = F)
+library(tidyverse)
+```
+
+
+Aplication exercise for search and cleaning occurrences from [GBif](https://www.gbif.org/) 
+
+### Get the data
+
+Search for a species of interest [*Puma concolor*](https://es.wikipedia.org/wiki/Puma_concolor)
+
+```{r}
+library(rgbif)
+#obtain data from GBIF via rgbif
+dat <- occ_search(scientificName = "Puma concolor", limit = 5000,
+                  return = "data", hasCoordinate = T)
+
+#names(dat$data) #a lot of columns
+
+#select columns of interest
+dat <- dat$data %>%
+  dplyr::select(species, decimalLongitude, decimalLatitude, countryCode,
+                individualCount,gbifID, family, taxonRank,
+                coordinateUncertaintyInMeters, year,
+                basisOfRecord, institutionCode, datasetName)
+names(dat)
+dim(dat)
+```
+
+### Record cleaning
+
+First let's look the data
+
+-remove records without coordinates
+
+```{r}
+dat <- dat %>%
+  filter(!is.na(decimalLongitude))%>%
+  filter(!is.na(decimalLatitude))
+
+dim(dat)
+```
+
+-Visualize the data on a map
+```{r}
+library(ggplot2)
+
+#plot data to get an overview
+wm <- borders("world", colour="gray70", fill="gray80")
+ggplot()+ 
+  coord_fixed()+ 
+  wm +
+  geom_point(data = dat, 
+             aes(x = decimalLongitude, y = decimalLatitude),
+             colour = "red", size = 0.9)+
+  theme_bw()+ 
+  labs(title = paste("Spatial distribution of records",dat$species))
+```
+
+Then we will mark all suspicious records
+
+```{r}
+#Use CoordinateCleaner to automatically flag problematic records
+
+
+library(countrycode)
+#convert country code from ISO2c to ISO3c
+dat$countryCode <-  countrycode(dat$countryCode, 
+                                origin =  'iso2c', 
+                                destination = 'iso3c')
+
+
+library(CoordinateCleaner)
+#flag problems
+dat <- data.frame(dat)
+flags <- clean_coordinates(x = dat, 
+                           lon = "decimalLongitude", lat = "decimalLatitude",
+                           countries = "countryCode", 
+                           species = "species",
+                           tests = c("capitals", "centroids", "equal",
+                                     "gbif", "institutions",
+                                     "zeros")) # most test are on by default
+
+summary(flags)
+
+plot(flags, lon = "decimalLongitude", lat = "decimalLatitude")
+
+#Exclude problematic records
+dat_cl <- dat[flags$.summary,]
+dim(dat_cl)
+#The flagged records
+dat_fl <- dat[!flags$.summary,]
+dim(dat_fl)
+```
+
+### Improving data quality using GBIF meta-data
+  
+-Remove records with low coordinate precision
+```{r}
+hist(dat_cl$coordinateUncertaintyInMeters / 1000, breaks = 20)
+
+dat_cl <- dat_cl %>% 
+  dplyr::filter(coordinateUncertaintyInMeters / 1000 <= 100 | is.na(coordinateUncertaintyInMeters))
+```
+
+### Remove unsuitable data sources
+
+```{r}
+
+table(dat$basisOfRecord)
+dat_cl <- filter(dat_cl, basisOfRecord == "HUMAN_OBSERVATION")
+
+table(dat_cl$basisOfRecord)
+
+#suspicious individual counts removal 
+#Individual count
+table(dat_cl$individualCount)
+
+dat_cl <- dat_cl%>%
+  filter(individualCount > 0 | is.na(individualCount))%>%
+  filter(individualCount < 99 | is.na(individualCount)) # high counts are not a problem
+
+```
+
+### Check for old records
+
+```{r}
+#remove very old records
+
+#Age of records
+table(dat_cl$year)
+
+dat_cl %>% 
+  group_by(year) %>% 
+  summarise(records=n()) %>% 
+  ggplot(aes(year, records))+
+  geom_line(color="steelblue")+
+  labs(title=paste("Number of records of:",dat_cl$species, "by year"),
+       y="",x="")+
+  theme_bw()
+```
+
+### Final publication map
+
+```{r}
+
+library("rnaturalearth")
+library(sf)
+library(ggspatial)
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+coords<-dat_cl %>% 
+  dplyr::select(species,decimalLongitude, decimalLatitude ) %>%
+  rename(Longitude=decimalLongitude, Latitude=decimalLatitude)
+
+coords_sf<- coords %>% 
+  st_as_sf(coords=(2:3))
+
+bbox_new <- st_bbox(coords_sf)
+
+
+ggplot()+
+  geom_sf(data = world, fill= NA) +
+  coord_sf(xlim=c(bbox_new[1],bbox_new[3]), 
+           ylim=c(bbox_new[2],bbox_new[4]))+
+    geom_point(data = dat_cl, aes(x = decimalLongitude, y = decimalLatitude),
+             colour = "cyan4", size = 1.2, alpha=0.6)+
+  annotation_scale(location = "br", width_hint = 0.1,line_width = 0.5) +
+  annotation_north_arrow(location = "tr", which_north = "true", 
+                         pad_x = unit(1.5, "cm"), 
+                         pad_y = unit(0.5, "cm"),
+                         height = unit(1, "cm"),
+                         width = unit(1, "cm"), # 0.2 # 0.3
+                         style = north_arrow_fancy_orienteering)+
+  labs(x = "", y = "",
+       title =paste("Record distribution of:", dat_cl$species),
+       caption = paste("Source: GBif\nAuthor: Julián Avila- Jiménez\nDate:",
+                       format(Sys.time(), '%d %B, %Y')))+
+  theme(plot.title=element_text(size=19),
+        plot.caption = element_text(size = 7, color="grey60"),
+        panel.background= element_rect(fill = "grey96"))
+
+```
+
+### Leaflet visualization
+
+```{r}
+library(leaflet)
+leaflet (dat_cl) %>%
+  addProviderTiles("Stamen.Terrain") %>% 
+  addCircleMarkers(lng=~decimalLongitude, 
+                   lat=~decimalLatitude,
+                   fillColor = "red",
+                   color = "red",
+                   radius = 5,
+                   opacity = 0.7,
+                   weight = 1) 
+
+```
+
